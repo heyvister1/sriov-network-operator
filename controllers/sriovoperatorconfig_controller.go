@@ -94,58 +94,89 @@ func (r *SriovOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	snolog.SetLogLevel(defaultConfig.Spec.LogLevel)
 
-	r.FeatureGate.Init(defaultConfig.Spec.FeatureGates)
-	logger.Info("enabled featureGates", "featureGates", r.FeatureGate.String())
+	// examine DeletionTimestamp to determine if object is under deletion
+	if defaultConfig.ObjectMeta.DeletionTimestamp.IsZero() {
 
-	if !defaultConfig.Spec.EnableInjector {
-		logger.Info("SR-IOV Network Resource Injector is disabled.")
-	}
-
-	if !defaultConfig.Spec.EnableOperatorWebhook {
-		logger.Info("SR-IOV Network Operator Webhook is disabled.")
-	}
-
-	// Fetch the SriovNetworkNodePolicyList
-	policyList := &sriovnetworkv1.SriovNetworkNodePolicyList{}
-	err = r.List(ctx, policyList, &client.ListOptions{})
-	if err != nil {
-		// Error reading the object - requeue the request.
-		return reconcile.Result{}, err
-	}
-	// Sort the policies with priority, higher priority ones is applied later
-	// We need to use the sort so we always get the policies in the same order
-	// That is needed so when we create the node Affinity for the sriov-device plugin
-	// it will remain in the same order and not trigger a pod recreation
-	sort.Sort(sriovnetworkv1.ByPriority(policyList.Items))
-
-	// Render and sync webhook objects
-	if err = r.syncWebhookObjs(ctx, defaultConfig); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	// Sync SriovNetworkConfigDaemon objects
-	if err = r.syncConfigDaemonSet(ctx, defaultConfig); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	if err = syncPluginDaemonObjs(ctx, r.Client, r.Scheme, defaultConfig, policyList); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	if err = r.syncMetricsExporter(ctx, defaultConfig); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	// For Openshift we need to create the systemd files using a machine config
-	if vars.ClusterType == consts.ClusterTypeOpenshift {
-		// TODO: add support for hypershift as today there is no MCO on hypershift clusters
-		if r.PlatformHelper.IsHypershift() {
-			return ctrl.Result{}, fmt.Errorf("systemd mode is not supported on hypershift")
+		if !sriovnetworkv1.StringInArray(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers) {
+			defaultConfig.ObjectMeta.Finalizers = append(defaultConfig.ObjectMeta.Finalizers, sriovnetworkv1.OPERATORCONFIGFINALIZERNAME)
+			if err := r.Update(ctx, defaultConfig); err != nil {
+				return reconcile.Result{}, err
+			}
 		}
 
-		if err = r.syncOpenShiftSystemdService(ctx, defaultConfig); err != nil {
+		r.FeatureGate.Init(defaultConfig.Spec.FeatureGates)
+		logger.Info("enabled featureGates", "featureGates", r.FeatureGate.String())
+
+		if !defaultConfig.Spec.EnableInjector {
+			logger.Info("SR-IOV Network Resource Injector is disabled.")
+		}
+
+		if !defaultConfig.Spec.EnableOperatorWebhook {
+			logger.Info("SR-IOV Network Operator Webhook is disabled.")
+		}
+
+		// Fetch the SriovNetworkNodePolicyList
+		policyList := &sriovnetworkv1.SriovNetworkNodePolicyList{}
+		err = r.List(ctx, policyList, &client.ListOptions{})
+		if err != nil {
+			// Error reading the object - requeue the request.
 			return reconcile.Result{}, err
 		}
+		// Sort the policies with priority, higher priority ones is applied later
+		// We need to use the sort so we always get the policies in the same order
+		// That is needed so when we create the node Affinity for the sriov-device plugin
+		// it will remain in the same order and not trigger a pod recreation
+		sort.Sort(sriovnetworkv1.ByPriority(policyList.Items))
+
+		// Render and sync webhook objects
+		if err = r.syncWebhookObjs(ctx, defaultConfig); err != nil {
+			return reconcile.Result{}, err
+		}
+
+		// Sync SriovNetworkConfigDaemon objects
+		if err = r.syncConfigDaemonSet(ctx, defaultConfig); err != nil {
+			return reconcile.Result{}, err
+		}
+
+		if err = syncPluginDaemonObjs(ctx, r.Client, r.Scheme, defaultConfig, policyList); err != nil {
+			return reconcile.Result{}, err
+		}
+
+		if err = r.syncMetricsExporter(ctx, defaultConfig); err != nil {
+			return reconcile.Result{}, err
+		}
+
+		// For Openshift we need to create the systemd files using a machine config
+		if vars.ClusterType == consts.ClusterTypeOpenshift {
+			// TODO: add support for hypershift as today there is no MCO on hypershift clusters
+			if r.PlatformHelper.IsHypershift() {
+				return ctrl.Result{}, fmt.Errorf("systemd mode is not supported on hypershift")
+			}
+
+			if err = r.syncOpenShiftSystemdService(ctx, defaultConfig); err != nil {
+				return reconcile.Result{}, err
+			}
+		}
+	} else {
+		// The object is being deleted
+		if sriovnetworkv1.StringInArray(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers) {
+			// our finalizer is present, so lets handle any external dependency
+			logger.Info("delete SriovOperatorConfig CR", "Namespace", defaultConfig.Namespace, "Name", defaultConfig.Name)
+			// make sure webhooks objects are deleted prior of removing finalizer
+			err := r.deleteAllWebhooks(ctx)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+			// remove our finalizer from the list and update it.
+			var found bool
+			defaultConfig.ObjectMeta.Finalizers, found = sriovnetworkv1.RemoveString(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers)
+			if found {
+				if err := r.Update(ctx, defaultConfig); err != nil {
+					return reconcile.Result{}, err
+				}
+			}
+		}
+		return reconcile.Result{}, err
 	}
 
 	logger.Info("Reconcile SriovOperatorConfig completed successfully")
@@ -300,7 +331,6 @@ func (r *SriovOperatorConfigReconciler) syncWebhookObjs(ctx context.Context, dc 
 		data.Data["OperatorWebhookCA"] = os.Getenv("ADMISSION_CONTROLLERS_CERTIFICATES_OPERATOR_CA_CRT")
 		data.Data["InjectorWebhookSecretName"] = os.Getenv("ADMISSION_CONTROLLERS_CERTIFICATES_INJECTOR_SECRET_NAME")
 		data.Data["InjectorWebhookCA"] = os.Getenv("ADMISSION_CONTROLLERS_CERTIFICATES_INJECTOR_CA_CRT")
-		data.Data["OperatorGeneratedResourcesLabelSelector"] = os.Getenv("OPERATOR_GENERATED_RESOURCES_LABEL_SELECTOR")
 
 		data.Data["ExternalControlPlane"] = false
 		if r.PlatformHelper.IsOpenshiftCluster() {

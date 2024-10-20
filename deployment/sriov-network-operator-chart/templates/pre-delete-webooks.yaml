@@ -1,3 +1,7 @@
+# The following job will be used as Helm pre-delete hook. It executes a small go-client binary
+# which intent to delete 'default' SriovOperatorConfig, that triggers operator removal of generated cluster objects
+# e.g. mutating/validating webhooks, within operator's recoinciling loop and 
+# preventing operator cluster object remainings while using helm uninstall
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -12,13 +16,10 @@ spec:
       serviceAccountName: {{ include "sriov-network-operator.fullname" . }}
       containers:
         - name: cleanup
-          image: {{ .Values.images.webhook }}
+          image: {{ .Values.images.operator }}
           command:
-            - webhook
+            - sriov-network-operator-config-cleanup
           args:
-            - delete
             - --namespace
             - {{ .Release.Namespace }}
-            - --label-selector
-            - "created-by={{ .Values.operator.admissionControllers.labelSelector | default (include "sriov-network-operator.fullname" .) }}"
       restartPolicy: Never    
