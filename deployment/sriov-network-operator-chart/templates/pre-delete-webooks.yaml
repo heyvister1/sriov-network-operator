@@ -23,3 +23,5 @@ spec:
             - --namespace
             - {{ .Release.Namespace }}
       restartPolicy: Never
+  backoffLimit: 2
+      
