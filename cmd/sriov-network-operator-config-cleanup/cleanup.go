@@ -2,67 +2,73 @@ package main
 
 import (
 	"context"
-	"os"
+	"time"
 
 	snolog "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/log"
 	"github.com/spf13/cobra"
-	"k8s.io/client-go/dynamic"
-
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/client/clientset/versioned/typed/sriovnetwork/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
 )
 
 var (
 	namespace string
+	watchTO   int
 )
 
 func init() {
 	rootCmd.Flags().StringVarP(&namespace, "namespace", "n", "", "designated SriovOperatorConfig namespace")
-}
-
-func DynamicClientFor(g schema.GroupVersionKind, obj *unstructured.Unstructured, namespace string) (dynamic.ResourceInterface, error) {
-	return nil, nil
+	rootCmd.Flags().IntVarP(&watchTO, "watch-timeout", "w", 10, "sriov-operator config post-delete watch timeout ")
 }
 
 func runCleanupCmd(cmd *cobra.Command, args []string) error {
-	var (
-		config *rest.Config
-		err    error
-	)
 	// init logger
 	snolog.InitLog()
 	setupLog := log.Log.WithName("sriov-network-operator-config-cleanup")
-
 	setupLog.Info("Run sriov-network-operator-config-cleanup")
 
-	// creates the in-cluster config
-	kubeconfig := os.Getenv("KUBECONFIG")
-	if kubeconfig != "" {
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-	} else {
-		config, err = rest.InClusterConfig()
-	}
-	if err != nil {
-		setupLog.Error(err, "failed initialization k8s rest config")
-	}
+	// adding context timeout although client-go Delete should be non-blocking by default
+	ctx, timeoutFunc := context.WithTimeout(context.Background(), time.Second*time.Duration(watchTO))
+	defer timeoutFunc()
 
-	sriovcs, err := sriovnetworkv1.NewForConfig(config)
+	restConfig := ctrl.GetConfigOrDie()
+	sriovcs, err := sriovnetworkv1.NewForConfig(restConfig)
 	if err != nil {
 		setupLog.Error(err, "failed to create 'sriovnetworkv1' clientset")
 	}
 
-	sriovcs.SriovOperatorConfigs(namespace).Delete(context.Background(), "default", metav1.DeleteOptions{})
+	err = sriovcs.SriovOperatorConfigs(namespace).Delete(context.Background(), "default", metav1.DeleteOptions{})
 	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
 		setupLog.Error(err, "failed to delete SriovOperatorConfig")
 		return err
 	}
 
-	return nil
+	// watching 'default' config deletion with context timeout, in case sriov-operator fails to delete 'default' config
+	watcher, err := sriovcs.SriovOperatorConfigs(namespace).Watch(ctx, metav1.ListOptions{Watch: true})
+	defer watcher.Stop()
+	if err != nil {
+		setupLog.Error(err, "failed creating 'default' SriovOperatorConfig object watcher")
+		return err
+	}
+	for {
+		select {
+		case event := <-watcher.ResultChan():
+			if event.Type == watch.Deleted {
+				setupLog.Info("'default' SriovOperatorConfig is deleted")
+				return nil
+			}
 
+		case <-ctx.Done():
+			err = ctx.Err()
+			setupLog.Error(err, "timeout has occurred for 'default' SriovOperatorConfig deletion")
+			return err
+		}
+	}
 }

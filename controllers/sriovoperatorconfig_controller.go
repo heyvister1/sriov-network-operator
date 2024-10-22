@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/go-logr/logr"
 	machinev1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
 
 	sriovnetworkv1 "github.com/k8snetworkplumbingwg/sriov-network-operator/api/v1"
@@ -83,8 +84,6 @@ func (r *SriovOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Info("default SriovOperatorConfig object not found. waiting for creation.")
-
-			err := r.deleteAllWebhooks(ctx)
 			return reconcile.Result{}, err
 		}
 		// Error reading the object - requeue the request.
@@ -95,88 +94,70 @@ func (r *SriovOperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.
 	snolog.SetLogLevel(defaultConfig.Spec.LogLevel)
 
 	// examine DeletionTimestamp to determine if object is under deletion
-	if defaultConfig.ObjectMeta.DeletionTimestamp.IsZero() {
-
-		if !sriovnetworkv1.StringInArray(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers) {
-			defaultConfig.ObjectMeta.Finalizers = append(defaultConfig.ObjectMeta.Finalizers, sriovnetworkv1.OPERATORCONFIGFINALIZERNAME)
-			if err := r.Update(ctx, defaultConfig); err != nil {
-				return reconcile.Result{}, err
-			}
-		}
-
-		r.FeatureGate.Init(defaultConfig.Spec.FeatureGates)
-		logger.Info("enabled featureGates", "featureGates", r.FeatureGate.String())
-
-		if !defaultConfig.Spec.EnableInjector {
-			logger.Info("SR-IOV Network Resource Injector is disabled.")
-		}
-
-		if !defaultConfig.Spec.EnableOperatorWebhook {
-			logger.Info("SR-IOV Network Operator Webhook is disabled.")
-		}
-
-		// Fetch the SriovNetworkNodePolicyList
-		policyList := &sriovnetworkv1.SriovNetworkNodePolicyList{}
-		err = r.List(ctx, policyList, &client.ListOptions{})
-		if err != nil {
-			// Error reading the object - requeue the request.
-			return reconcile.Result{}, err
-		}
-		// Sort the policies with priority, higher priority ones is applied later
-		// We need to use the sort so we always get the policies in the same order
-		// That is needed so when we create the node Affinity for the sriov-device plugin
-		// it will remain in the same order and not trigger a pod recreation
-		sort.Sort(sriovnetworkv1.ByPriority(policyList.Items))
-
-		// Render and sync webhook objects
-		if err = r.syncWebhookObjs(ctx, defaultConfig); err != nil {
-			return reconcile.Result{}, err
-		}
-
-		// Sync SriovNetworkConfigDaemon objects
-		if err = r.syncConfigDaemonSet(ctx, defaultConfig); err != nil {
-			return reconcile.Result{}, err
-		}
-
-		if err = syncPluginDaemonObjs(ctx, r.Client, r.Scheme, defaultConfig, policyList); err != nil {
-			return reconcile.Result{}, err
-		}
-
-		if err = r.syncMetricsExporter(ctx, defaultConfig); err != nil {
-			return reconcile.Result{}, err
-		}
-
-		// For Openshift we need to create the systemd files using a machine config
-		if vars.ClusterType == consts.ClusterTypeOpenshift {
-			// TODO: add support for hypershift as today there is no MCO on hypershift clusters
-			if r.PlatformHelper.IsHypershift() {
-				return ctrl.Result{}, fmt.Errorf("systemd mode is not supported on hypershift")
-			}
-
-			if err = r.syncOpenShiftSystemdService(ctx, defaultConfig); err != nil {
-				return reconcile.Result{}, err
-			}
-		}
-	} else {
+	if !defaultConfig.ObjectMeta.DeletionTimestamp.IsZero() {
 		// The object is being deleted
-		if sriovnetworkv1.StringInArray(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers) {
-			// our finalizer is present, so lets handle any external dependency
-			logger.Info("delete SriovOperatorConfig CR", "Namespace", defaultConfig.Namespace, "Name", defaultConfig.Name)
-			// make sure webhooks objects are deleted prior of removing finalizer
-			err := r.deleteAllWebhooks(ctx)
-			if err != nil {
-				return reconcile.Result{}, err
-			}
-			// remove our finalizer from the list and update it.
-			var found bool
-			defaultConfig.ObjectMeta.Finalizers, found = sriovnetworkv1.RemoveString(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers)
-			if found {
-				if err := r.Update(ctx, defaultConfig); err != nil {
-					return reconcile.Result{}, err
-				}
-			}
+		return r.handleSriovOperatorConfigDeletion(ctx, defaultConfig, logger)
+	}
+	// add finalizer if needed
+	if !sriovnetworkv1.StringInArray(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers) {
+		defaultConfig.ObjectMeta.Finalizers = append(defaultConfig.ObjectMeta.Finalizers, sriovnetworkv1.OPERATORCONFIGFINALIZERNAME)
+		if err := r.Update(ctx, defaultConfig); err != nil {
+			return reconcile.Result{}, err
 		}
+	}
+
+	r.FeatureGate.Init(defaultConfig.Spec.FeatureGates)
+	logger.Info("enabled featureGates", "featureGates", r.FeatureGate.String())
+
+	if !defaultConfig.Spec.EnableInjector {
+		logger.Info("SR-IOV Network Resource Injector is disabled.")
+	}
+
+	if !defaultConfig.Spec.EnableOperatorWebhook {
+		logger.Info("SR-IOV Network Operator Webhook is disabled.")
+	}
+
+	// Fetch the SriovNetworkNodePolicyList
+	policyList := &sriovnetworkv1.SriovNetworkNodePolicyList{}
+	err = r.List(ctx, policyList, &client.ListOptions{})
+	if err != nil {
+		// Error reading the object - requeue the request.
 		return reconcile.Result{}, err
+	}
+	// Sort the policies with priority, higher priority ones is applied later
+	// We need to use the sort so we always get the policies in the same order
+	// That is needed so when we create the node Affinity for the sriov-device plugin
+	// it will remain in the same order and not trigger a pod recreation
+	sort.Sort(sriovnetworkv1.ByPriority(policyList.Items))
+
+	// Render and sync webhook objects
+	if err = r.syncWebhookObjs(ctx, defaultConfig); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// Sync SriovNetworkConfigDaemon objects
+	if err = r.syncConfigDaemonSet(ctx, defaultConfig); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if err = syncPluginDaemonObjs(ctx, r.Client, r.Scheme, defaultConfig, policyList); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if err = r.syncMetricsExporter(ctx, defaultConfig); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// For Openshift we need to create the systemd files using a machine config
+	if vars.ClusterType == consts.ClusterTypeOpenshift {
+		// TODO: add support for hypershift as today there is no MCO on hypershift clusters
+		if r.PlatformHelper.IsHypershift() {
+			return ctrl.Result{}, fmt.Errorf("systemd mode is not supported on hypershift")
+		}
+
+		if err = r.syncOpenShiftSystemdService(ctx, defaultConfig); err != nil {
+			return reconcile.Result{}, err
+		}
 	}
 
 	logger.Info("Reconcile SriovOperatorConfig completed successfully")
@@ -463,6 +444,31 @@ func (r *SriovOperatorConfigReconciler) syncOpenShiftSystemdService(ctx context.
 
 	// Sync machine config
 	return r.setLabelInsideObject(ctx, cr, objs)
+}
+
+func (r *SriovOperatorConfigReconciler) handleSriovOperatorConfigDeletion(ctx context.Context,
+	defaultConfig *sriovnetworkv1.SriovOperatorConfig, logger logr.Logger) (ctrl.Result, error) {
+
+	var err error
+	if sriovnetworkv1.StringInArray(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers) {
+		// our finalizer is present, so lets handle any external dependency
+		logger.Info("delete SriovOperatorConfig CR", "Namespace", defaultConfig.Namespace, "Name", defaultConfig.Name)
+		// make sure webhooks objects are deleted prior of removing finalizer
+		err = r.deleteAllWebhooks(ctx)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		// remove our finalizer from the list and update it.
+		var found bool
+		defaultConfig.ObjectMeta.Finalizers, found = sriovnetworkv1.RemoveString(sriovnetworkv1.OPERATORCONFIGFINALIZERNAME, defaultConfig.ObjectMeta.Finalizers)
+		if found {
+			if err := r.Update(ctx, defaultConfig); err != nil {
+				return reconcile.Result{}, err
+			}
+		}
+	}
+
+	return reconcile.Result{}, err
 }
 
 func (r SriovOperatorConfigReconciler) setLabelInsideObject(ctx context.Context, cr *sriovnetworkv1.SriovOperatorConfig, objs []*uns.Unstructured) error {

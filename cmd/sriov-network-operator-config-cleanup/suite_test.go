@@ -45,6 +45,7 @@ var _ = BeforeSuite(func() {
 
 	// Go to project root directory
 	err := os.Chdir("../..")
+	Expect(err).NotTo(HaveOccurred())
 
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
@@ -58,9 +59,7 @@ var _ = BeforeSuite(func() {
 	Expect(cfg).NotTo(BeNil())
 
 	apiserverDir := testEnv.ControlPlane.GetAPIServer().CertDir
-	println("aprserver path:", apiserverDir)
 	kubecfgPath = findKubecfg(apiserverDir, ".kubecfg")
-	println("got kubecfg:", kubecfgPath)
 	err = os.Setenv("KUBECONFIG", kubecfgPath)
 	Expect(err).NotTo(HaveOccurred())
 

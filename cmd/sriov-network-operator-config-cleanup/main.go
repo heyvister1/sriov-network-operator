@@ -4,11 +4,10 @@ import (
 	"flag"
 	"os"
 
+	snolog "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/log"
 	"github.com/spf13/cobra"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-
-	snolog "github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/log"
 )
 
 const (
@@ -26,15 +25,13 @@ Example: sriov-network-operator-config-cleanup -n <sriov-operator ns>`,
 	}
 )
 
-func init() {
+func main() {
 	klog.InitFlags(nil)
 	snolog.BindFlags(flag.CommandLine)
 	rootCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
-}
 
-func main() {
 	if err := rootCmd.Execute(); err != nil {
-		log.Log.Error(err, "Error executing", componentName)
+		log.Log.Error(err, "Error executing sriov-network-operator-config-cleanup")
 		os.Exit(1)
 	}
 }
