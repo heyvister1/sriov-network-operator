@@ -788,6 +788,24 @@ func (s *sriov) configSriovDevice(iface *sriovnetworkv1.Interface, skipVFConfigu
 
 func (s *sriov) ConfigSriovInterfaces(storeManager store.ManagerInterface,
 	interfaces []sriovnetworkv1.Interface, ifaceStatuses []sriovnetworkv1.InterfaceExt, skipVFConfiguration bool) error {
+	// Detach PF uplinks and stale VF representors from managed OVS bridges before any
+	// SR-IOV work. Runs unconditionally so it covers the case where a previous daemon
+	// instance was killed (e.g. by nic-configuration.wait gating) after configuring
+	// some PFs: the new instance sees those PFs as already-configured, takes the
+	// early-return in createVFs, and would otherwise leave their pre-reboot OVSDB
+	// entries in place.
+	if vars.ManageSoftwareBridges {
+		for i := range interfaces {
+			iface := &interfaces[i]
+			if sriovnetworkv1.GetEswitchModeFromSpec(iface) != sriovnetworkv1.ESwithModeSwitchDev {
+				continue
+			}
+			if err := s.detachPFFromBridge(iface.PciAddress, iface.Name, iface.NumVfs); err != nil {
+				return fmt.Errorf("pre-reconcile bridge cleanup failed for %s: %w", iface.PciAddress, err)
+			}
+		}
+	}
+
 	toBeConfigured, toBeResetted, err := s.getConfigureAndReset(storeManager, interfaces, ifaceStatuses)
 	if err != nil {
 		log.Log.Error(err, "cannot get a list of interfaces to configure")
@@ -1246,16 +1264,6 @@ func (s *sriov) createVFs(iface *sriovnetworkv1.Interface) error {
 			log.Log.V(2).Info("createVFs(): device is already configured",
 				"device", iface.PciAddress, "count", iface.NumVfs, "mode", expectedEswitchMode)
 			return nil
-		}
-	}
-	// Clean stale VF representor interfaces and detach PF uplink from the managed
-	// bridge before VF re-creation. After host reboot, representors from the previous
-	// lifecycle remain in the bridge; the PF uplink also needs to be detached because
-	// setEswitchModeAndNumVFsMlx() skips detachPFFromBridge() when NIC is already
-	// in legacy mode (which is always the case after reboot).
-	if expectedEswitchMode == sriovnetworkv1.ESwithModeSwitchDev {
-		if err := s.detachPFFromBridge(iface.PciAddress, iface.Name, iface.NumVfs); err != nil {
-			return err
 		}
 	}
 	return s.setEswitchModeAndNumVFs(iface.PciAddress, iface.Name, expectedEswitchMode, iface.NumVfs)
