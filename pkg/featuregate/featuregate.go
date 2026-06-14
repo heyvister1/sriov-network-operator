@@ -32,7 +32,7 @@ var DefaultFeatureStates = map[string]bool{
 	consts.MetricsExporterFeatureGate:                  false,
 	consts.ManageSoftwareBridgesFeatureGate:            false,
 	consts.BlockDevicePluginUntilConfiguredFeatureGate: true,
-	consts.MellanoxFirmwareResetFeatureGate:            false,
+	consts.MellanoxFirmwareResetFeatureGate:            true,
 	consts.DynamicResourceAllocationFeatureGate:        false, // Default: use device plugin
 }
 
